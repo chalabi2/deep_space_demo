@@ -2,6 +2,8 @@ use cosmos_sdk_proto_althea::{
     cosmos::tx::v1beta1::{TxBody, TxRaw},
 };
 
+//use serde_derive::{Deserialize, Serialize};
+
 use deep_space::{
     client::Contact,
     utils::decode_any,
@@ -14,7 +16,6 @@ use std::{
 };
 
 use warp::reply::{Json, WithStatus};
-use base64::engine::general_purpose::URL_SAFE;
 use base64::{encode, decode, Engine};
 use warp::{Filter, Rejection};
 use rocksdb::{Options, DB};
@@ -28,6 +29,14 @@ lazy_static! {
         msgs: 0
     }));
 }
+
+//could i just add something like this to serialize the message value then store it in the db?
+// #[derive(Debug, Serialize, Deserialize)]
+// pub struct Tx {
+//     pub tx_hash: String,
+//     pub msg_type: String,
+//     pub msg_value: String,
+// }
 
 pub struct Counters {
     blocks: u64,
@@ -82,7 +91,10 @@ async fn search(contact: &Contact, start: u64, end: u64, db: &DB) {
                 msg_counter += 1;
 
                 // Store the message type and value in the RocksDB
-                let key = encode(&tx_hash);
+                // I think im doing something dumb here message type because we shouldnt have to use that to query the db
+                let key = &tx_hash;
+
+                //this is where i want to serialize the message value and store it in the db so i can query the tx and get json
                 let value = base64::encode(&message.value);
                 db.put(key.as_bytes(), value.as_bytes()).expect("Failed to write to database");
             }
@@ -127,6 +139,8 @@ async fn transaction_handler(
         let tx_hash = decode(tx_key).map_err(|_| warp::reject::not_found())?;
         match db.get(&tx_hash) {
             Ok(Some(value_bytes)) => {
+
+                //this is where i want to deserialize the message value and return it as json after i have queried the tx from the db
                 let value_json: Value = serde_json::from_slice(&value_bytes).unwrap_or_else(|_| Value::String("Unable to deserialize message".to_string()));
 
                 Ok(warp::reply::with_status(warp::reply::json(&value_json), warp::http::StatusCode::OK))
