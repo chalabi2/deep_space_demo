@@ -1,9 +1,39 @@
-use deep_space::client::Contact;
-use futures::future::join_all;
-use std::{
-    collections::HashMap,
-    time::{Duration, Instant},
+use cosmos_sdk_proto_althea::{
+    cosmos::tx::v1beta1::{TxBody, TxRaw},
 };
+
+use deep_space::{
+    client::Contact,
+    utils::decode_any,
+};
+use futures::future::join_all;
+use lazy_static::lazy_static;
+use std::{
+    sync::{Arc, RwLock},
+    time::{Duration, Instant}, collections::HashMap,
+};
+
+use warp::reply::{Json, WithStatus};
+use base64::engine::general_purpose::URL_SAFE;
+use base64::{encode, decode, Engine};
+use warp::{Filter, Rejection};
+use rocksdb::{Options, DB};
+use serde_json::{Value, json};
+
+
+lazy_static! {
+    static ref COUNTER: Arc<RwLock<Counters>> = Arc::new(RwLock::new(Counters {
+        blocks: 0,
+        transactions: 0,
+        msgs: 0
+    }));
+}
+
+pub struct Counters {
+    blocks: u64,
+    transactions: u64,
+    msgs: u64,
+}
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -11,8 +41,9 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// node will not have history from chain halt upgrades and could be state synced
 /// and missing history before the state sync
 /// Iterative implementation due to the limitations of async recursion in rust.
+
 async fn get_earliest_block(contact: &Contact, mut start: u64, mut end: u64) -> u64 {
-    while start != end {
+    while start <= end {
         let mid = start + (end - start) / 2;
         let mid_block = contact.get_block(mid).await;
         if let Ok(Some(_)) = mid_block {
@@ -21,14 +52,106 @@ async fn get_earliest_block(contact: &Contact, mut start: u64, mut end: u64) -> 
             start = mid + 1;
         }
     }
-    start
+    // off by one error correction fix bounds logic up top
+    start + 1
 }
 
-#[tokio::main(flavor = "current_thread")]
+async fn search(contact: &Contact, start: u64, end: u64, db: &DB) {
+    let blocks = contact.get_block_range(start, end).await.unwrap();
+
+    let mut tx_counter = 0;
+    let mut msg_counter = 0;
+    let blocks_len = blocks.len() as u64;
+    for block in blocks {
+        let block = block.unwrap();
+        for tx in block.data.unwrap().txs {
+            tx_counter += 1;
+
+            let raw_tx_any = prost_types::Any {
+                type_url: "/cosmos.tx.v1beta1.TxRaw".to_string(),
+                value: tx,
+            };
+            let tx_raw: TxRaw = decode_any(raw_tx_any).unwrap();
+            let tx_hash = sha256::digest_bytes(&tx_raw.body_bytes);
+            let body_any = prost_types::Any {
+                type_url: "/cosmos.tx.v1beta1.TxBody".to_string(),
+                value: tx_raw.body_bytes,
+            };
+            let tx_body: TxBody = decode_any(body_any).unwrap();
+            for message in tx_body.messages {
+                msg_counter += 1;
+
+                // Store the message type and value in the RocksDB
+                let key = encode(&tx_hash);
+                let value = base64::encode(&message.value);
+                db.put(key.as_bytes(), value.as_bytes()).expect("Failed to write to database");
+            }
+        }
+    }
+    let mut c = COUNTER.write().unwrap();
+    c.blocks += blocks_len;
+    c.transactions += tx_counter;
+    c.msgs += msg_counter;
+}
+
+fn init_db() -> DB {
+    let path = "tx_db";
+    let mut options = Options::default();
+    options.create_if_missing(true);
+    DB::open(&options, &path).expect("Failed to open the database")
+}
+
+async fn transaction_api(db: Arc<DB>) {
+    // GET /transaction?tx_key=tx_{}_{} to retrieve transaction data
+    let transaction_route = warp::path("transaction")
+        .and(warp::get())
+        .and(warp::query::<HashMap<String, String>>())
+        .and(with_db(db.clone()))
+        .and_then(transaction_handler);
+
+    let routes = transaction_route;
+
+    warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
+}
+
+fn with_db(db: Arc<DB>) -> impl Filter<Extract = (Arc<DB>,), Error = std::convert::Infallible> + Clone {
+    warp::any().map(move || db.clone())
+}
+
+
+async fn transaction_handler(
+    params: HashMap<String, String>,
+    db: Arc<DB>,
+) -> Result<WithStatus<Json>, Rejection> {
+    if let Some(tx_key) = params.get("tx_key") {
+        let tx_hash = decode(tx_key).map_err(|_| warp::reject::not_found())?;
+        match db.get(&tx_hash) {
+            Ok(Some(value_bytes)) => {
+                let value_json: Value = serde_json::from_slice(&value_bytes).unwrap_or_else(|_| Value::String("Unable to deserialize message".to_string()));
+
+                Ok(warp::reply::with_status(warp::reply::json(&value_json), warp::http::StatusCode::OK))
+            }
+            Ok(None) => Ok(warp::reply::with_status(
+                warp::reply::json(&json!({"error": "Transaction not found"})),
+                warp::http::StatusCode::NOT_FOUND,
+            )),
+            Err(_) => Ok(warp::reply::with_status(
+                warp::reply::json(&json!({"error": "Error reading from database"})),
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            )),
+        }
+    } else {
+        Ok(warp::reply::with_status(
+            warp::reply::json(&json!({"error": "Missing parameter: tx_key"})),
+            warp::http::StatusCode::BAD_REQUEST,
+        ))
+    }
+}
+
+#[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let contact =
-        Contact::new("http://gravitychain.io:9090", TIMEOUT, "gravity").expect("invalid url");
-    let mut blocks = HashMap::new();
+    let contact = Contact::new("http://gravity-grpc.polkachu.com:14290", TIMEOUT, "gravity")
+        .expect("invalid url");
 
     let status = contact
         .get_chain_status()
@@ -48,51 +171,54 @@ async fn main() {
         "This node has {} blocks to download, starting clock now",
         latest_block - earliest_block
     );
-    let start = Instant::now();
 
-    // the actual block download logic, we're building an array of futures which we'll
-    // hand off to be executed in parallel, note that for gravitychain.io it's a node cluster
-    // meaning not all nodes have the exact same number of blocks (they are state synced) so
-    // we may download a smaller number of blocks than the latest block we find above as our
-    // connection is load balanced across the cluster to nodes with less history.
+    let db = Arc::new(init_db());
+    let api_fut = transaction_api(db.clone());
+    println!("Starting transaction API on port 3030");
 
-    // number of blocks to request as a single future, if we did single blocks
-    // the overhead of each connection would reduce total speed, a more complete
-    // implementation would auto-tune this value and not hand everything off to tokio
-    // at once, in order to really optimize performance given latency to the cluster.
-    const BATCH_SIZE: u64 = 100;
-    let mut pos = earliest_block;
-    let mut futures = Vec::new();
-    while pos < latest_block {
-        let start = pos;
-        let end = if latest_block - pos > BATCH_SIZE {
-            pos += BATCH_SIZE;
-            pos
-        } else {
-            pos = latest_block;
-            latest_block
-        };
-        let fut = contact.get_block_range(start, end);
-        futures.push(fut);
-    }
+    let processing_fut = async move {
+        let start = Instant::now();
 
-    // this is where we actually hand off all the futures to tokio to execute in parallel
-    // splitting this up to run lets say 10k at a time would reduce memory usage and allow
-    // indexing the results to a local database (sled or rocksdb) for easy review and instant re-runs
-    let results = join_all(futures).await;
-
-    // now we take the results, index them ignoring any that failed due to timeouts or
-    // other issues, a proper implementation would keep track of failures here and build
-    // another run specifically of failures.
-    for result in results.into_iter().flatten() {
-        for block in result.into_iter().flatten() {
-            blocks.insert(block.last_commit.clone().unwrap().height, block);
+        const BATCH_SIZE: u64 = 500;
+        const EXECUTE_SIZE: usize = 200;
+        let mut pos = earliest_block;
+        let mut futures = Vec::new();
+        while pos < latest_block {
+            let start = pos;
+            let end = if latest_block - pos > BATCH_SIZE {
+                pos += BATCH_SIZE;
+                pos
+            } else {
+                pos = latest_block;
+                latest_block
+            };
+            let fut = search(&contact, start, end, &db);
+            futures.push(fut);
         }
-    }
 
-    println!(
-        "Successfully downloaded {} blocks in {} seconds",
-        blocks.len(),
-        start.elapsed().as_secs()
-    )
+        let mut futures = futures.into_iter();
+
+        let mut buf = Vec::new();
+        while let Some(fut) = futures.next() {
+            if buf.len() < EXECUTE_SIZE {
+                buf.push(fut);
+            } else {
+                let _ = join_all(buf).await;
+                println!("Completed batch of {} blocks", BATCH_SIZE * EXECUTE_SIZE as u64);
+                buf = Vec::new();
+            }
+        }
+        let _ = join_all(buf).await;
+
+        let counter = COUNTER.read().unwrap();
+        println!(
+            "Successfully downloaded {} blocks and {} tx containing {} messages in {} seconds",
+            counter.blocks,
+            counter.transactions,
+            counter.msgs,
+            start.elapsed().as_secs()
+        )
+    };
+
+    tokio::join!(processing_fut, api_fut);
 }
