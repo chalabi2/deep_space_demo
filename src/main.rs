@@ -1,26 +1,25 @@
 use cosmos_sdk_proto_althea::{
     cosmos::tx::v1beta1::{TxBody, TxRaw},
+    ibc::applications::transfer::v1::MsgTransfer,
+    tendermint::types::Block,
 };
 
-//use serde_derive::{Deserialize, Serialize};
+use rocksdb::{Options, DB};
+use gravity_proto::gravity::MsgSendToEth;
+use warp::Filter;
+use serde::Serialize;
 
 use deep_space::{
     client::Contact,
-    utils::decode_any,
+    utils::{decode_any, decode_bytes},
 };
 use futures::future::join_all;
 use lazy_static::lazy_static;
 use std::{
+    collections::HashMap,
     sync::{Arc, RwLock},
-    time::{Duration, Instant}, collections::HashMap,
+    time::{Duration, Instant},
 };
-
-use warp::reply::{Json, WithStatus};
-use base64::{encode, decode, Engine};
-use warp::{Filter, Rejection};
-use rocksdb::{Options, DB};
-use serde_json::{Value, json};
-
 
 lazy_static! {
     static ref COUNTER: Arc<RwLock<Counters>> = Arc::new(RwLock::new(Counters {
@@ -30,18 +29,16 @@ lazy_static! {
     }));
 }
 
-//could i just add something like this to serialize the message value then store it in the db?
-// #[derive(Debug, Serialize, Deserialize)]
-// pub struct Tx {
-//     pub tx_hash: String,
-//     pub msg_type: String,
-//     pub msg_value: String,
-// }
-
 pub struct Counters {
     blocks: u64,
     transactions: u64,
     msgs: u64,
+}
+
+#[derive(Serialize)]
+pub struct ApiResponse {
+    tx_hash: String,
+    data: Vec<u8>,
 }
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -50,7 +47,6 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// node will not have history from chain halt upgrades and could be state synced
 /// and missing history before the state sync
 /// Iterative implementation due to the limitations of async recursion in rust.
-
 async fn get_earliest_block(contact: &Contact, mut start: u64, mut end: u64) -> u64 {
     while start <= end {
         let mid = start + (end - start) / 2;
@@ -89,77 +85,50 @@ async fn search(contact: &Contact, start: u64, end: u64, db: &DB) {
             let tx_body: TxBody = decode_any(body_any).unwrap();
             for message in tx_body.messages {
                 msg_counter += 1;
-
-                // Store the message type and value in the RocksDB
-                // I think im doing something dumb here message type because we shouldnt have to use that to query the db
-                let key = &tx_hash;
-
-                //this is where i want to serialize the message value and store it in the db so i can query the tx and get json
-                let value = base64::encode(&message.value);
-                db.put(key.as_bytes(), value.as_bytes()).expect("Failed to write to database");
+        
+                let send_to_eth_any = prost_types::Any {
+                    type_url: "/gravity.v1.MsgSendToEth".to_string(),
+                    value: message.value.clone(),
+                };
+                let msg_send_to_eth: Result<MsgSendToEth, _> = decode_any(send_to_eth_any);
+        
+                if let Ok(msg_send_to_eth) = msg_send_to_eth {
+                    // Store the MsgSendToEth transaction in the database
+                    let key = format!("msgSendToEth_{}", tx_hash);
+                    db.put(key, &message.value).expect("Failed to store MsgSendToEth transaction");
+                }
             }
         }
-    }
     let mut c = COUNTER.write().unwrap();
     c.blocks += blocks_len;
     c.transactions += tx_counter;
     c.msgs += msg_counter;
-}
-
-fn init_db() -> DB {
-    let path = "tx_db";
-    let mut options = Options::default();
-    options.create_if_missing(true);
-    DB::open(&options, &path).expect("Failed to open the database")
-}
-
-async fn transaction_api(db: Arc<DB>) {
-    // GET /transaction?tx_key=tx_{}_{} to retrieve transaction data
-    let transaction_route = warp::path("transaction")
-        .and(warp::get())
-        .and(warp::query::<HashMap<String, String>>())
-        .and(with_db(db.clone()))
-        .and_then(transaction_handler);
-
-    let routes = transaction_route;
-
-    warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
-}
-
-fn with_db(db: Arc<DB>) -> impl Filter<Extract = (Arc<DB>,), Error = std::convert::Infallible> + Clone {
-    warp::any().map(move || db.clone())
-}
-
-
-async fn transaction_handler(
-    params: HashMap<String, String>,
-    db: Arc<DB>,
-) -> Result<WithStatus<Json>, Rejection> {
-    if let Some(tx_key) = params.get("tx_key") {
-        let tx_hash = decode(tx_key).map_err(|_| warp::reject::not_found())?;
-        match db.get(&tx_hash) {
-            Ok(Some(value_bytes)) => {
-
-                //this is where i want to deserialize the message value and return it as json after i have queried the tx from the db
-                let value_json: Value = serde_json::from_slice(&value_bytes).unwrap_or_else(|_| Value::String("Unable to deserialize message".to_string()));
-
-                Ok(warp::reply::with_status(warp::reply::json(&value_json), warp::http::StatusCode::OK))
-            }
-            Ok(None) => Ok(warp::reply::with_status(
-                warp::reply::json(&json!({"error": "Transaction not found"})),
-                warp::http::StatusCode::NOT_FOUND,
-            )),
-            Err(_) => Ok(warp::reply::with_status(
-                warp::reply::json(&json!({"error": "Error reading from database"})),
-                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-            )),
-        }
-    } else {
-        Ok(warp::reply::with_status(
-            warp::reply::json(&json!({"error": "Missing parameter: tx_key"})),
-            warp::http::StatusCode::BAD_REQUEST,
-        ))
     }
+}
+
+async fn get_all_msg_send_to_eth_transactions(db: Arc<DB>) -> Result<impl warp::Reply, warp::Rejection> {
+    let mut response_data = Vec::new();
+
+    let iterator = db.iterator(rocksdb::IteratorMode::Start);
+
+    for item in iterator {
+        match item {
+            Ok((key, value)) => {
+                let key_str = String::from_utf8_lossy(&key);
+                if key_str.starts_with("msgSendToEth_") {
+                    response_data.push(ApiResponse {
+                        tx_hash: key_str[12..].to_string(),
+                        data: value.to_vec(),
+                    });
+                }
+            }
+            Err(err) => {
+                eprintln!("RocksDB iterator error: {}", err);
+            }
+        }
+    }
+
+    Ok(warp::reply::json(&response_data))
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -185,54 +154,60 @@ async fn main() {
         "This node has {} blocks to download, starting clock now",
         latest_block - earliest_block
     );
+    let start = Instant::now();
 
-    let db = Arc::new(init_db());
-    let api_fut = transaction_api(db.clone());
-    println!("Starting transaction API on port 3030");
+    let mut db_options = Options::default();
+    db_options.create_if_missing(true);
+    let db = DB::open(&db_options, "transactions_db").expect("Failed to open database");
 
-    let processing_fut = async move {
-        let start = Instant::now();
+    let db = Arc::new(db); 
 
-        const BATCH_SIZE: u64 = 500;
-        const EXECUTE_SIZE: usize = 200;
-        let mut pos = earliest_block;
-        let mut futures = Vec::new();
-        while pos < latest_block {
-            let start = pos;
-            let end = if latest_block - pos > BATCH_SIZE {
-                pos += BATCH_SIZE;
-                pos
-            } else {
-                pos = latest_block;
-                latest_block
-            };
-            let fut = search(&contact, start, end, &db);
-            futures.push(fut);
+    const BATCH_SIZE: u64 = 500;
+    const EXECUTE_SIZE: usize = 200;
+    let mut pos = earliest_block;
+    let mut futures = Vec::new();
+    while pos < latest_block {
+        let start = pos;
+        let end = if latest_block - pos > BATCH_SIZE {
+            pos += BATCH_SIZE;
+            pos
+        } else {
+            pos = latest_block;
+            latest_block
+        };
+        let fut = search(&contact, start, end, &db);
+        futures.push(fut);
+    }
+
+    let mut futures = futures.into_iter();
+
+    let mut buf = Vec::new();
+    while let Some(fut) = futures.next() {
+        if buf.len() < EXECUTE_SIZE {
+            buf.push(fut);
+        } else {
+            let _ = join_all(buf).await;
+            println!("Completed batch of {} blocks", BATCH_SIZE * EXECUTE_SIZE as u64);
+            buf = Vec::new();
         }
+    }
+    let _ = join_all(buf).await;
 
-        let mut futures = futures.into_iter();
+    let counter = COUNTER.read().unwrap();
+    println!(
+        "Successfully downloaded {} blocks and {} tx containing {} messages in {} seconds",
+        counter.blocks,
+        counter.transactions,
+        counter.msgs,
+        start.elapsed().as_secs()
+    );
 
-        let mut buf = Vec::new();
-        while let Some(fut) = futures.next() {
-            if buf.len() < EXECUTE_SIZE {
-                buf.push(fut);
-            } else {
-                let _ = join_all(buf).await;
-                println!("Completed batch of {} blocks", BATCH_SIZE * EXECUTE_SIZE as u64);
-                buf = Vec::new();
-            }
-        }
-        let _ = join_all(buf).await;
+    // Start the API server after data is downloaded
+    let api_db = db.clone();
+    let api_route = warp::path("transactions")
+        .and(warp::get())
+        .and_then(move || get_all_msg_send_to_eth_transactions(api_db.clone()));
 
-        let counter = COUNTER.read().unwrap();
-        println!(
-            "Successfully downloaded {} blocks and {} tx containing {} messages in {} seconds",
-            counter.blocks,
-            counter.transactions,
-            counter.msgs,
-            start.elapsed().as_secs()
-        )
-    };
-
-    tokio::join!(processing_fut, api_fut);
+    println!("Starting the API server at 127.0.0.1:3030");
+    warp::serve(api_route).run(([127, 0, 0, 1], 3030)).await;
 }
