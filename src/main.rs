@@ -1,22 +1,20 @@
 use cosmos_sdk_proto_althea::{
     cosmos::tx::v1beta1::{TxBody, TxRaw},
-    ibc::applications::transfer::v1::MsgTransfer,
-    tendermint::types::Block,
 };
 
 use rocksdb::{Options, DB};
 use gravity_proto::gravity::MsgSendToEth;
 use warp::Filter;
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 
 use deep_space::{
     client::Contact,
-    utils::{decode_any, decode_bytes},
+    utils::decode_any,
 };
+
 use futures::future::join_all;
 use lazy_static::lazy_static;
 use std::{
-    collections::HashMap,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
@@ -35,14 +33,61 @@ pub struct Counters {
     msgs: u64,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+pub struct CustomMsgSendToEth {
+    sender: String,
+    eth_dest: String,
+    amount: Vec<CustomCoin>,
+    bridge_fee: Vec<CustomCoin>,
+    chain_fee: Vec<CustomCoin>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct CustomCoin {
+    denom: String,
+    amount: String,
+}
+
 #[derive(Serialize)]
 pub struct ApiResponse {
     tx_hash: String,
-    data: Vec<u8>,
+    data: serde_json::Value,
+}
+
+impl From<&MsgSendToEth> for CustomMsgSendToEth {
+    fn from(msg: &MsgSendToEth) -> Self {
+        CustomMsgSendToEth {
+            sender: msg.sender.clone(),
+            eth_dest: msg.eth_dest.clone(),
+            amount: msg
+                .amount
+                .iter()
+                .map(|coin| CustomCoin {
+                    denom: coin.denom.clone(),
+                    amount: coin.amount.clone(),
+                })
+                .collect(),
+                bridge_fee: msg
+                .amount
+                .iter()
+                .map(|coin| CustomCoin {
+                    denom: coin.denom.clone(),
+                    amount: coin.amount.clone(),
+                })
+                .collect(),
+                chain_fee: msg
+                .amount
+                .iter()
+                .map(|coin| CustomCoin {
+                    denom: coin.denom.clone(),
+                    amount: coin.amount.clone(),
+                })
+                .collect(),
+        }
+    }
 }
 
 const TIMEOUT: Duration = Duration::from_secs(5);
-
 /// finds earliest available block using binary search, keep in mind this cosmos
 /// node will not have history from chain halt upgrades and could be state synced
 /// and missing history before the state sync
@@ -67,43 +112,55 @@ async fn search(contact: &Contact, start: u64, end: u64, db: &DB) {
     let mut tx_counter = 0;
     let mut msg_counter = 0;
     let blocks_len = blocks.len() as u64;
+    let mut current_block = start;
+
     for block in blocks {
         let block = block.unwrap();
-        for tx in block.data.unwrap().txs {
-            tx_counter += 1;
 
+        for tx in block.data.unwrap().txs {
             let raw_tx_any = prost_types::Any {
                 type_url: "/cosmos.tx.v1beta1.TxRaw".to_string(),
                 value: tx,
             };
             let tx_raw: TxRaw = decode_any(raw_tx_any).unwrap();
-            let tx_hash = sha256::digest_bytes(&tx_raw.body_bytes);
+            let tx_hash = hex::encode(sha256::digest_bytes(&tx_raw.body_bytes));
             let body_any = prost_types::Any {
                 type_url: "/cosmos.tx.v1beta1.TxBody".to_string(),
                 value: tx_raw.body_bytes,
             };
             let tx_body: TxBody = decode_any(body_any).unwrap();
+
+            let mut has_msg_send_to_eth = false;
             for message in tx_body.messages {
-                msg_counter += 1;
-        
-                let send_to_eth_any = prost_types::Any {
-                    type_url: "/gravity.v1.MsgSendToEth".to_string(),
-                    value: message.value.clone(),
-                };
-                let msg_send_to_eth: Result<MsgSendToEth, _> = decode_any(send_to_eth_any);
-        
-                if let Ok(msg_send_to_eth) = msg_send_to_eth {
-                    // Store the MsgSendToEth transaction in the database
-                    let key = format!("msgSendToEth_{}", tx_hash);
-                    db.put(key, &message.value).expect("Failed to store MsgSendToEth transaction");
+                if message.type_url == "/gravity.v1.MsgSendToEth" {
+                    has_msg_send_to_eth = true;
+                    msg_counter += 1;
+            
+                    let msg_send_to_eth_any = prost_types::Any {
+                        type_url: "/gravity.v1.MsgSendToEth".to_string(),
+                        value: message.value,
+                    };
+                    let msg_send_to_eth: Result<MsgSendToEth, _> = decode_any(msg_send_to_eth_any);
+            
+                    if let Ok(msg_send_to_eth) = msg_send_to_eth {
+                        let custom_msg_send_to_eth = CustomMsgSendToEth::from(&msg_send_to_eth);
+                        println!("Decoded MsgSendToEth: {:?}", custom_msg_send_to_eth);
+                        let key = format!("msgSendToEth_{}", tx_hash);
+                        save_msg_send_to_eth(db, &key, &custom_msg_send_to_eth);
+                    }
                 }
             }
+            if has_msg_send_to_eth {
+                tx_counter += 1;
+            }
         }
+        current_block += 1;
+    }
     let mut c = COUNTER.write().unwrap();
     c.blocks += blocks_len;
     c.transactions += tx_counter;
     c.msgs += msg_counter;
-    }
+    println!("Finished processing blocks. Total blocks: {}, Total transactions: {}, Total MsgSendToEth messages: {}", c.blocks, c.transactions, c.msgs);
 }
 
 async fn get_all_msg_send_to_eth_transactions(db: Arc<DB>) -> Result<impl warp::Reply, warp::Rejection> {
@@ -116,9 +173,11 @@ async fn get_all_msg_send_to_eth_transactions(db: Arc<DB>) -> Result<impl warp::
             Ok((key, value)) => {
                 let key_str = String::from_utf8_lossy(&key);
                 if key_str.starts_with("msgSendToEth_") {
+                    let msg_send_to_eth: CustomMsgSendToEth = serde_json::from_slice(&value).unwrap();
+                    println!("Queried MsgSendToEth: {:?}", msg_send_to_eth);
                     response_data.push(ApiResponse {
-                        tx_hash: key_str[12..].to_string(),
-                        data: value.to_vec(),
+                        tx_hash: key_str.replace("msgSendToEth_", ""),
+                        data: serde_json::to_value(&msg_send_to_eth).unwrap(),
                     });
                 }
             }
@@ -127,7 +186,7 @@ async fn get_all_msg_send_to_eth_transactions(db: Arc<DB>) -> Result<impl warp::
             }
         }
     }
-
+    response_data.sort_by(|a, b| a.tx_hash.cmp(&b.tx_hash));
     Ok(warp::reply::json(&response_data))
 }
 
@@ -151,16 +210,29 @@ async fn main() {
     // the error message you get when requesting an earlier block, but this was more fun
     let earliest_block = get_earliest_block(&contact, 0, latest_block).await;
     println!(
-        "This node has {} blocks to download, starting clock now",
+        "This node has {} blocks to download, downloading to database",
         latest_block - earliest_block
     );
     let start = Instant::now();
 
     let mut db_options = Options::default();
     db_options.create_if_missing(true);
-    let db = DB::open(&db_options, "transactions_db").expect("Failed to open database");
+    let db = DB::open(&db_options, "transactions").expect("Failed to open database");
 
     let db = Arc::new(db); 
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+//Timestamp for downloading blocks to database
+    let should_download = match load_last_download_timestamp(&db) {
+        Some(timestamp) => now - timestamp > 1,
+        None => true,
+    };
+
+    if should_download {
 
     const BATCH_SIZE: u64 = 500;
     const EXECUTE_SIZE: usize = 200;
@@ -201,7 +273,10 @@ async fn main() {
         counter.msgs,
         start.elapsed().as_secs()
     );
-
+    save_last_download_timestamp(&db, now);
+} else {
+    println!("Database exists and is less than 1 day old");
+}
     // Start the API server after data is downloaded
     let api_db = db.clone();
     let api_route = warp::path("transactions")
@@ -210,4 +285,28 @@ async fn main() {
 
     println!("Starting the API server at 127.0.0.1:3030");
     warp::serve(api_route).run(([127, 0, 0, 1], 3030)).await;
+}
+
+
+fn save_msg_send_to_eth(db: &DB, key: &str, data: &CustomMsgSendToEth) {
+    println!("Saved MsgSendToEth with key: {}", key);
+    let data_json = serde_json::to_string(data).unwrap();
+    db.put(key.as_bytes(), data_json.as_bytes()).unwrap();
+}
+
+// Load the MsgSendToEth transaction
+pub fn load_msg_send_to_eth(db: &DB, key: &str) -> Option<CustomMsgSendToEth> {
+    let res = db.get(key.as_bytes()).unwrap();
+    res.map(|bytes| serde_json::from_slice::<CustomMsgSendToEth>(&bytes).unwrap())
+}
+
+fn save_last_download_timestamp(db: &DB, timestamp: u64) {
+    let key = "last_download_timestamp";
+    db.put(key.as_bytes(), timestamp.to_string().as_bytes()).unwrap();
+}
+
+fn load_last_download_timestamp(db: &DB) -> Option<u64> {
+    let key = "last_download_timestamp";
+    let res = db.get(key.as_bytes()).unwrap();
+    res.map(|bytes| String::from_utf8_lossy(&bytes).parse::<u64>().unwrap())
 }
