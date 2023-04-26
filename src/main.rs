@@ -2,9 +2,10 @@ use cosmos_sdk_proto_althea::{
     cosmos::tx::v1beta1::{TxBody, TxRaw},
 };
 
+use env_logger;
 use rocksdb::{Options, DB};
 use gravity_proto::gravity::MsgSendToEth;
-use warp::Filter;
+use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
 use serde::{Serialize, Deserialize};
 
 use deep_space::{
@@ -163,7 +164,8 @@ async fn search(contact: &Contact, start: u64, end: u64, db: &DB) {
     println!("Finished processing blocks. Total blocks: {}, Total transactions: {}, Total MsgSendToEth messages: {}", c.blocks, c.transactions, c.msgs);
 }
 
-async fn get_all_msg_send_to_eth_transactions(db: Arc<DB>) -> Result<impl warp::Reply, warp::Rejection> {
+#[get("/transactions")]
+async fn get_all_msg_send_to_eth_transactions(db: web::Data<Arc<DB>>) -> impl Responder {
     let mut response_data = Vec::new();
 
     let iterator = db.iterator(rocksdb::IteratorMode::Start);
@@ -187,11 +189,12 @@ async fn get_all_msg_send_to_eth_transactions(db: Arc<DB>) -> Result<impl warp::
         }
     }
     response_data.sort_by(|a, b| a.tx_hash.cmp(&b.tx_hash));
-    Ok(warp::reply::json(&response_data))
+    HttpResponse::Ok().json(response_data)
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
     let contact = Contact::new("http://gravity-grpc.polkachu.com:14290", TIMEOUT, "gravity")
         .expect("invalid url");
 
@@ -217,9 +220,7 @@ async fn main() {
 
     let mut db_options = Options::default();
     db_options.create_if_missing(true);
-    let db = DB::open(&db_options, "transactions").expect("Failed to open database");
-
-    let db = Arc::new(db); 
+    let db = Arc::new(DB::open(&db_options, "transactions").expect("Failed to open database"));
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -228,7 +229,7 @@ async fn main() {
 
 //Timestamp for downloading blocks to database
     let should_download = match load_last_download_timestamp(&db) {
-        Some(timestamp) => now - timestamp > 1,
+        Some(timestamp) => now - timestamp > 86400,
         None => true,
     };
 
@@ -277,15 +278,29 @@ async fn main() {
 } else {
     println!("Database exists and is less than 1 day old");
 }
-    // Start the API server after data is downloaded
-    let api_db = db.clone();
-    let api_route = warp::path("transactions")
-        .and(warp::get())
-        .and_then(move || get_all_msg_send_to_eth_transactions(api_db.clone()));
+    let api_db = web::Data::new(db.clone()); // Pass the wrapped database instance to App::app_data()
 
-    println!("Starting the API server at 127.0.0.1:3030");
-    warp::serve(api_route).run(([127, 0, 0, 1], 3030)).await;
+println!("Starting the API server at 127.0.0.1:3030");
+
+HttpServer::new(move || {
+    let cors = actix_cors::Cors::default()
+        .allow_any_origin()
+        .allow_any_method()
+        .allow_any_header()
+        .max_age(3600);
+
+    App::new()
+        .wrap(cors)
+        .app_data(api_db.clone()) // Pass the wrapped database instance to App::app_data()
+        .service(get_all_msg_send_to_eth_transactions)
+})
+.bind("127.0.0.1:3030")
+.unwrap()
+.run()
+.await
+.unwrap();
 }
+
 
 
 fn save_msg_send_to_eth(db: &DB, key: &str, data: &CustomMsgSendToEth) {

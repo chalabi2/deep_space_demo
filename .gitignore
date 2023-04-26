@@ -1,3 +1,6 @@
 /target
 /transactions
 ./transactions
+
+/transactions_db
+./transactions_db
